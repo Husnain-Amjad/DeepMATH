@@ -1,0 +1,23 @@
+# ---- Common (both CUDA and ROCm) ----
+transformers>=4.46
+accelerate
+peft
+trl>=0.12
+datasets
+sympy
+antlr4-python3-runtime==4.11
+
+# ---- Backend-specific: install torch/vllm/bitsandbytes separately, see below ----
+#
+# CUDA (NVIDIA):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   pip install vllm
+#   pip install bitsandbytes          # optional, enables --use_bnb 4-bit QLoRA
+#
+# ROCm (AMD, e.g. MI210/MI250/MI300):
+#   pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
+#   # vLLM on ROCm is NOT a plain `pip install vllm` - use AMD's ROCm vLLM
+#   # docker image, or build from source per: https://docs.vllm.ai/en/latest/getting_started/amd-installation.html
+#   # If you skip vLLM, grpo_train.py automatically falls back to the slower
+#   # HF-generate rollout backend - still correct, just lower throughput.
+#   # bitsandbytes: skip it (--use_bnb is auto-disabled on ROCm in these scripts).
