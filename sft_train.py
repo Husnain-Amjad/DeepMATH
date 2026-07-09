@@ -182,7 +182,7 @@ def main():
         bf16=args.bf16,
         logging_steps=10,
         save_strategy="epoch",
-        max_seq_length=args.max_seq_len,
+        max_length=args.max_seq_len,
         packing=args.packing,  # TRL packs with EOS-bounded loss masking, so
                                 # <think>/<solution> boundaries stay intact even packed
         gradient_checkpointing=True,
