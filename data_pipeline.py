@@ -15,7 +15,7 @@ Design notes:
   - Numeric perturbation requires verification (sympy recompute or self-consistency
     vote) before being accepted into the training set.
 """
-
+from datasets import load_dataset
 import argparse
 import json
 import hashlib
@@ -27,6 +27,17 @@ from typing import Optional
 from datasets import load_dataset, Dataset
 
 from reward_fn import extract_boxed, answers_match, score_completion
+
+from pathlib import Path
+import os
+
+def ensure_output_path(filepath: str):
+    """
+    Creates parent directories if they do not exist.
+    """
+    path = Path(filepath)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 SUBJECTS = [
     "algebra", "counting_and_probability", "geometry", "intermediate_algebra",
@@ -99,32 +110,28 @@ def build_think_section(row: dict) -> str:
     return f"{header}\n{trace}".strip() if header else trace
 
 
-def load_skill_labels(path: str):
+def load_skill_labels(split="train"):
     """
-    Loads the actual skill-labeled dataset schema:
-      subject, level, problem, original_solution, model_answer, reasoning_trace
-      (inline [SKILL: ...] tags per step, ending 'ANSWER: \\boxed{...}'),
-      skills_used_in_steps, minimum_skills, n_skills, _extraction_raw.
-    Accepts .jsonl or .csv. Returns a dict keyed by problem-hash -> row.
+    Loads the Skill_MATH dataset directly from HuggingFace.
+
+    Dataset:
+        HusnainAmjad/Skill_MATH
     """
+    ds = load_dataset(
+        "HusnainAmjad/Skill_MATH",
+        split=split
+    )
+
     labels = {}
-    if path.endswith(".csv"):
-        import csv
-        with open(path, newline="") as f:
-            reader = csv.DictReader(f)
-            for obj in reader:
-                labels[_hash_problem(obj["problem"])] = obj
-    else:
-        with open(path, "r") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                obj = json.loads(line)
-                labels[_hash_problem(obj["problem"])] = obj
+
+    for row in ds:
+        row = dict(row)
+        labels[_hash_problem(row["problem"])] = row
+
     return labels
 
 
-def build_sft_dataset(skill_label_path: str, out_path: str, split: str = "train",
+def build_sft_dataset(out_path: str, split: str = "train",
                        include_unlabeled_fallback: bool = True):
     """
     Builds SFT examples directly from the skill-labeled dataset (self-contained:
@@ -133,7 +140,7 @@ def build_sft_dataset(skill_label_path: str, out_path: str, split: str = "train"
     the skill-labeling pass hasn't covered yet, so training data isn't capped by
     labeling progress.
     """
-    labels = load_skill_labels(skill_label_path)
+    labels = load_skill_labels(split)
     examples = []
 
     for pid, row in labels.items():
@@ -181,7 +188,9 @@ def build_sft_dataset(skill_label_path: str, out_path: str, split: str = "train"
             n_fallback += 1
 
     print(f"[build-sft] skill-labeled examples: {n_labeled}, unlabeled fallback: {n_fallback}")
-    with open(out_path, "w") as f:
+    
+    out_path = ensure_output_path(out_path)
+    with open(out_path, "w", encoding="utf-8") as f:
         for ex in examples:
             f.write(json.dumps(ex) + "\n")
     print(f"[build-sft] wrote {len(examples)} examples -> {out_path}")
@@ -194,6 +203,7 @@ def diagnose(predictions_path: str, out_report_path: str):
     Outputs per (subject, level) accuracy to find weak clusters.
     """
     stats = defaultdict(lambda: [0, 0])  # (subject, level) -> [correct, total]
+    predictions_path =  ensure_output_path(predictions_path)
     with open(predictions_path) as f:
         for line in f:
             obj = json.loads(line)
@@ -208,7 +218,7 @@ def diagnose(predictions_path: str, out_report_path: str):
         acc = correct / total if total else 0.0
         report.append({"subject": subject, "level": level, "accuracy": round(acc, 4), "n": total})
         print(f"{subject:28s} L{level:>2}  acc={acc:.3f}  n={total}")
-
+    out_report_path = ensure_output_path(out_report_path)
     with open(out_report_path, "w") as f:
         json.dump(report, f, indent=2)
 
@@ -270,7 +280,7 @@ def generate_semantic_perturbations(weak_report: list, math_rows: list, generato
                 "solution": row["solution"],  # gold answer unchanged: meaning-preserving
                 "augmentation": "semantic_perturbation",
             })
-
+    out_path = ensure_output_path(out_path)
     with open(out_path, "w") as f:
         for ex in out:
             f.write(json.dumps(ex) + "\n")
@@ -368,6 +378,7 @@ def generate_numeric_perturbations(weak_report: list, math_rows: list, solver_fn
 
     print(f"[augment-numeric] accepted={accepted} rejected={rejected} "
           f"(agreement threshold={agreement_threshold})")
+    out_path = ensure_output_path(out_path)
     with open(out_path, "w") as f:
         for ex in out:
             f.write(json.dumps(ex) + "\n")
@@ -428,7 +439,7 @@ def generate_multi_solutions(weak_report: list, math_rows: list, sampler_fn,
                 "variant_index": i,
                 "augmentation": "multi_solution_rejection_sampling",
             })
-
+    out_path = ensure_output_path(out_path)
     with open(out_path, "w") as f:
         for ex in out:
             f.write(json.dumps(ex) + "\n")
@@ -443,7 +454,7 @@ if __name__ == "__main__":
     ap.add_argument("--augment-numeric", action="store_true")
     ap.add_argument("--multi-solution", action="store_true")
 
-    ap.add_argument("--skill-labels", type=str, default="data/skill_labels.jsonl")
+    # ap.add_argument("--skill-labels", type=str, default="skill_labels.jsonl")
     ap.add_argument("--split", type=str, default="train")
     ap.add_argument("--out", type=str, default="outputs/sft_data.jsonl")
     ap.add_argument("--predictions", type=str, default="outputs/predictions.jsonl")
@@ -452,7 +463,10 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     if args.build_sft:
-        build_sft_dataset(args.skill_labels, args.out, args.split)
+        build_sft_dataset(
+            out_path=args.out,
+            split=args.split,
+        )
     elif args.diagnose:
         diagnose(args.predictions, args.weak_report)
     else:
