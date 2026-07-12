@@ -26,6 +26,9 @@ from datasets import Dataset, concatenate_datasets
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from trl import SFTTrainer, SFTConfig
 
+from determinism import set_all_seeds
+from storage_utils import ensure_dir, add_destination_args, dispatch_destination
+
 # ---------------------------------------------------------------------------
 # ROCm / CUDA portability notes:
 #   - ROCm PyTorch builds expose the same torch.cuda.* API namespace as CUDA
@@ -124,8 +127,24 @@ def main():
                      help="Pack multiple examples per sequence (TRL handles EOS-bounded "
                           "loss masking) to cut padding waste - meaningfully faster on "
                           "variable-length math solutions.")
+    ap.add_argument("--seed", type=int, default=42,
+                     help="controls weight init RNG, LoRA dropout masks, and data "
+                          "shuffle order. Fixing this makes repeated runs on the SAME "
+                          "machine/library stack close to reproducible - it does NOT "
+                          "guarantee identical results across different GPUs/driver/"
+                          "CUDA-vs-ROCm versions (floating-point reduction order differs "
+                          "at the kernel level regardless of seed).")
+    ap.add_argument("--strict_deterministic", action="store_true", default=False,
+                     help="opt-in: forces deterministic algorithms where available. "
+                          "Slower - off by default.")
+    ap.add_argument("--skip_merge", action="store_true", default=False,
+                     help="skip the automatic LoRA merge-and-save step (mode=lora only). "
+                          "Use if you specifically want to keep only the adapter, e.g. "
+                          "for vLLM's --enable-lora serving mode instead of a merged model.")
+    add_destination_args(ap, default_repo_type="model")
     args = ap.parse_args()
 
+    set_all_seeds(args.seed, strict_deterministic=args.strict_deterministic)
     torch.backends.cuda.matmul.allow_tf32 = True  # no-op on ROCm, free speedup on CUDA
 
     if args.use_bnb and is_rocm():
@@ -180,6 +199,8 @@ def main():
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
         bf16=args.bf16,
+        seed=args.seed,
+        data_seed=args.seed,
         logging_steps=10,
         save_strategy="epoch",
         max_length=args.max_seq_len,
@@ -196,10 +217,44 @@ def main():
         processing_class=tokenizer,
         peft_config=peft_config,
     )
+    ensure_dir(args.output_dir)
     trainer.train()
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     print(f"[sft_train] saved to {args.output_dir}")
+
+    # This is the artifact eval/vLLM/GRPO should actually load: for full-FT it's
+    # just output_dir; for LoRA it's the merged dir (adapter-only dirs can't be
+    # loaded directly by vLLM - see merge_lora.py for the same fix applied to
+    # older/intermediate checkpoints that predate this auto-merge).
+    final_model_dir = args.output_dir
+
+    if args.mode == "lora" and not args.skip_merge:
+        merged_dir = args.output_dir.rstrip("/") + "_merged"
+        print(f"[sft_train] mode=lora -> attempting merge-and-save to {merged_dir} "
+              f"(this is what you should point --model at for eval/vLLM/GRPO).")
+        try:
+            ensure_dir(merged_dir)
+            merged_model = trainer.model.merge_and_unload()
+            merged_model.save_pretrained(merged_dir)
+            tokenizer.save_pretrained(merged_dir)
+            print(f"[sft_train] merged model saved -> {merged_dir}")
+            final_model_dir = merged_dir
+        except Exception as e:
+            print(f"[sft_train] WARNING: LoRA merge failed ({type(e).__name__}: {e}). "
+                  f"The adapter-only checkpoint at {args.output_dir} is still valid and "
+                  f"saved, but vLLM/transformers can't load it directly - run "
+                  f"`python merge_lora.py --base_model {args.model} "
+                  f"--adapter_path {args.output_dir} --out {merged_dir}` manually once "
+                  f"you've resolved the issue. Common cause: base model was loaded "
+                  f"quantized (--use_bnb) - LoRA can't merge into quantized weights; "
+                  f"rerun without --use_bnb if you need a merged model.")
+    elif args.mode == "lora" and args.skip_merge:
+        print(f"[sft_train] --skip_merge set: leaving {args.output_dir} as an "
+              f"adapter-only checkpoint. Use merge_lora.py later if you need a "
+              f"standalone model, or serve it via vLLM's --enable-lora mode directly.")
+
+    dispatch_destination(final_model_dir, args)
 
 
 if __name__ == "__main__":

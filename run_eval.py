@@ -14,6 +14,8 @@ import json
 import data_pipeline as dp
 from run_augmentation import build_backend, MATH_PROMPT_TEMPLATE
 from reward_fn import extract_boxed
+from determinism import set_all_seeds
+from storage_utils import ensure_output_path, add_destination_args, dispatch_destination
 
 
 def main():
@@ -25,19 +27,24 @@ def main():
     ap.add_argument("--max_tokens", type=int, default=1024)
     ap.add_argument("--limit", type=int, default=None,
                      help="cap number of problems for a quick smoke test")
+    ap.add_argument("--seed", type=int, default=42)
+    add_destination_args(ap, default_repo_type="dataset")
     args = ap.parse_args()
+
+    set_all_seeds(args.seed)
 
     math_rows = dp.load_hendrycks_math(args.split)
     if args.limit:
         math_rows = math_rows[:args.limit]
     print(f"[run_eval] evaluating on {len(math_rows)} problems ({args.split} split)")
 
-    backend = build_backend(args.model, args.use_vllm)
+    backend = build_backend(args.model, args.use_vllm, seed=args.seed)
     prompts = [MATH_PROMPT_TEMPLATE.format(problem=r["problem"]) for r in math_rows]
 
     # batch through vLLM in one call if available; HF backend loops internally
     completions = backend.generate(prompts, n=1, temperature=0.0, max_tokens=args.max_tokens)
 
+    ensure_output_path(args.out)
     with open(args.out, "w") as f:
         for row, comp in zip(math_rows, completions):
             gold = extract_boxed(row["solution"])
@@ -52,6 +59,7 @@ def main():
             }) + "\n")
 
     print(f"[run_eval] wrote predictions -> {args.out}")
+    dispatch_destination(args.out, args)
     print("Next: python data_pipeline.py --diagnose --predictions "
           f"{args.out} --weak-report outputs/weak_clusters.json")
 

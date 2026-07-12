@@ -21,6 +21,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
 from reward_fn import score_completion, extract_boxed
+from determinism import set_all_seeds
+from storage_utils import ensure_dir, add_destination_args, dispatch_destination
 
 # ---------------------------------------------------------------------------
 # ROCm notes:
@@ -131,8 +133,15 @@ def main():
     ap.add_argument("--use_vllm", action="store_true", default=True)
     ap.add_argument("--lora_r", type=int, default=32)
     ap.add_argument("--lora_alpha", type=int, default=64)
+    ap.add_argument("--seed", type=int, default=42,
+                     help="see sft_train.py --seed docstring - same scope/caveats apply, "
+                          "plus GRPO rollout sampling itself is stochastic per-step "
+                          "regardless of this seed (that's the point of on-policy sampling).")
+    ap.add_argument("--strict_deterministic", action="store_true", default=False)
+    add_destination_args(ap, default_repo_type="model")
     args = ap.parse_args()
 
+    set_all_seeds(args.seed, strict_deterministic=args.strict_deterministic)
     torch.backends.cuda.matmul.allow_tf32 = True  # no-op on ROCm, free speedup on CUDA
 
     if args.use_vllm and not vllm_available():
@@ -142,6 +151,7 @@ def main():
               "rollout backend - correct, but noticeably slower rollouts.")
         args.use_vllm = False
 
+    ensure_dir(args.output_dir)
     train_ds = load_grpo_prompts(args.data)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -167,6 +177,7 @@ def main():
     grpo_config = GRPOConfig(
         output_dir=args.output_dir,
         learning_rate=args.lr,
+        seed=args.seed,
         per_device_train_batch_size=args.per_device_batch_size,
         gradient_accumulation_steps=args.grad_accum,
         num_generations=args.num_generations,
@@ -194,6 +205,7 @@ def main():
     trainer.train()
     trainer.save_model(args.output_dir)
     print(f"[grpo_train] saved to {args.output_dir}")
+    dispatch_destination(args.output_dir, args)
 
 
 if __name__ == "__main__":

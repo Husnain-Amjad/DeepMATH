@@ -2,7 +2,7 @@
 Data pipeline for the skill-metacognition + GRPO training run.
 
 Stages implemented here:
-  --build-sft          : merge your skill-label file with hendrycks_math -> SFT jsonl
+  --build-sft          : build SFT jsonl from the skill-labeled dataset (+ hendrycks_math fallback)
   --diagnose            : evaluate a checkpoint, report accuracy by (subject, level)
   --augment-semantic     : semantic-preserving perturbation of weak clusters (prioritized)
   --augment-numeric       : numeric-literal perturbation with verification (secondary)
@@ -10,34 +10,28 @@ Stages implemented here:
 
 Design notes:
   - "think" section = short skill label + semantic extraction (entities/quantities/
-    relations/operation type), not just a category tag.
+    relations/operation type), not just a category tag - built from the skill-labeled
+    dataset's own reasoning_trace, which already carries inline [SKILL: ...] tags.
   - Semantic perturbation is meaning-preserving -> gold answer is reused as-is.
-  - Numeric perturbation requires verification (sympy recompute or self-consistency
-    vote) before being accepted into the training set.
+  - Numeric perturbation requires verification (self-consistency vote) before being
+    accepted into the training set.
+  - All augmentation functions batch model calls across problems rather than looping
+    one problem at a time - see run_augmentation.py for the model-connected drivers.
+  - Every write path auto-creates its parent directory; every read path fails with a
+    clear message if missing, rather than silently creating an empty directory next
+    to a file that was never there.
 """
-from datasets import load_dataset
+
 import argparse
 import json
 import hashlib
 import re
 from collections import defaultdict
-from pathlib import Path
-from typing import Optional
 
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 
-from reward_fn import extract_boxed, answers_match, score_completion
-
-from pathlib import Path
-import os
-
-def ensure_output_path(filepath: str):
-    """
-    Creates parent directories if they do not exist.
-    """
-    path = Path(filepath)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+from reward_fn import extract_boxed, answers_match
+from storage_utils import ensure_output_path, require_input_path, add_destination_args, dispatch_destination
 
 SUBJECTS = [
     "algebra", "counting_and_probability", "geometry", "intermediate_algebra",
@@ -54,6 +48,8 @@ CHAT_TEMPLATE = (
 _SKILL_TAG_RE = re.compile(r"\[SKILL:\s*([^\]]+)\]")
 _ANSWER_LINE_RE = re.compile(r"\n?ANSWER:\s*\\boxed\{.*?\}\s*$", re.IGNORECASE | re.DOTALL)
 _MINIMUM_SKILLS_PREFIX_RE = re.compile(r"^\s*MINIMUM_SKILLS:\s*", re.IGNORECASE)
+
+DEFAULT_SKILL_REPO = "HusnainAmjad/Skill_MATH"
 
 
 def _hash_problem(problem: str) -> str:
@@ -86,23 +82,19 @@ def clean_skill_list(raw: str) -> str:
 
 def strip_trailing_answer_line(reasoning_trace: str) -> str:
     """Removes the trailing 'ANSWER: \\boxed{...}' line from reasoning_trace so the
-    <think> section doesn't duplicate the boxed answer that appears in <solution>
-    (avoids teaching the model to leak the answer format twice / anchor on it early)."""
+    <think> section doesn't duplicate the boxed answer that appears in <solution>."""
     return _ANSWER_LINE_RE.sub("", reasoning_trace).strip()
 
 
 def build_think_section(row: dict) -> str:
     """
     Builds the <think> content directly from the skill-labeled reasoning_trace,
-    which already contains inline [SKILL: ...] tags before each step - this is
-    the real metacognitive signal, so it's kept close to verbatim rather than
-    reduced to a single category tag. A short header line names the minimal
-    skill set so it's independently checkable at eval time.
+    which already contains inline [SKILL: ...] tags before each step - kept close
+    to verbatim rather than reduced to a single category tag. A short header line
+    names the minimal skill set so it's independently checkable at eval time.
     """
     min_skills = clean_skill_list(row.get("minimum_skills", ""))
     if not min_skills:
-        # fall back to the noisier raw extraction field only if the clean
-        # field is genuinely empty
         min_skills = clean_skill_list(row.get("_extraction_raw", "")) or row.get("skills_used_in_steps", "")
 
     trace = strip_trailing_answer_line(row.get("reasoning_trace", ""))
@@ -110,29 +102,44 @@ def build_think_section(row: dict) -> str:
     return f"{header}\n{trace}".strip() if header else trace
 
 
-def load_skill_labels(split="train"):
+def load_skill_labels(split: str = "train", repo_id: str = DEFAULT_SKILL_REPO,
+                       local_path: str = None):
     """
-    Loads the Skill_MATH dataset directly from HuggingFace.
-
-    Dataset:
-        HusnainAmjad/Skill_MATH
+    Loads the skill-labeled dataset either from a local jsonl/csv file (if
+    local_path is given - useful for offline work or a custom labeling batch),
+    or from a Hugging Face Hub dataset repo otherwise (default: HusnainAmjad/Skill_MATH).
+    Returns a dict keyed by a hash of the problem text.
     """
-    ds = load_dataset(
-        "HusnainAmjad/Skill_MATH",
-        split=split
-    )
-
     labels = {}
+    if local_path:
+        local_path = str(require_input_path(local_path))
+        if local_path.endswith(".csv"):
+            import csv
+            with open(local_path, newline="") as f:
+                reader = csv.DictReader(f)
+                for obj in reader:
+                    labels[_hash_problem(obj["problem"])] = obj
+        else:
+            with open(local_path, "r") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    labels[_hash_problem(obj["problem"])] = obj
+        print(f"[load_skill_labels] loaded {len(labels)} rows from local file {local_path}")
+        return labels
 
+    ds = load_dataset(repo_id, split=split)
     for row in ds:
         row = dict(row)
         labels[_hash_problem(row["problem"])] = row
-
+    print(f"[load_skill_labels] loaded {len(labels)} rows from hf://{repo_id} (split={split})")
     return labels
 
 
 def build_sft_dataset(out_path: str, split: str = "train",
-                       include_unlabeled_fallback: bool = True):
+                       include_unlabeled_fallback: bool = True,
+                       skill_repo: str = DEFAULT_SKILL_REPO, skill_labels_file: str = None):
     """
     Builds SFT examples directly from the skill-labeled dataset (self-contained:
     it already carries problem/solution/subject/level, no join needed). Optionally
@@ -140,7 +147,7 @@ def build_sft_dataset(out_path: str, split: str = "train",
     the skill-labeling pass hasn't covered yet, so training data isn't capped by
     labeling progress.
     """
-    labels = load_skill_labels(split)
+    labels = load_skill_labels(split, repo_id=skill_repo, local_path=skill_labels_file)
     examples = []
 
     for pid, row in labels.items():
@@ -188,8 +195,8 @@ def build_sft_dataset(out_path: str, split: str = "train",
             n_fallback += 1
 
     print(f"[build-sft] skill-labeled examples: {n_labeled}, unlabeled fallback: {n_fallback}")
-    
-    out_path = ensure_output_path(out_path)
+
+    ensure_output_path(out_path)
     with open(out_path, "w", encoding="utf-8") as f:
         for ex in examples:
             f.write(json.dumps(ex) + "\n")
@@ -199,11 +206,16 @@ def build_sft_dataset(out_path: str, split: str = "train",
 def diagnose(predictions_path: str, out_report_path: str):
     """
     predictions_path: jsonl with fields {problem_id, subject, level, prediction, gold_boxed}
-    produced by your own eval/generation script after Stage 1 SFT.
-    Outputs per (subject, level) accuracy to find weak clusters.
+    produced by run_eval.py after a training stage. Outputs per (subject, level)
+    accuracy to find weak clusters.
     """
     stats = defaultdict(lambda: [0, 0])  # (subject, level) -> [correct, total]
-    predictions_path =  ensure_output_path(predictions_path)
+
+    # READ path: fail clearly if missing, rather than creating a directory next
+    # to a file that was never produced (that was the actual bug - a write-path
+    # helper doesn't fix a missing read-path file).
+    predictions_path = str(require_input_path(predictions_path))
+
     with open(predictions_path) as f:
         for line in f:
             obj = json.loads(line)
@@ -218,7 +230,8 @@ def diagnose(predictions_path: str, out_report_path: str):
         acc = correct / total if total else 0.0
         report.append({"subject": subject, "level": level, "accuracy": round(acc, 4), "n": total})
         print(f"{subject:28s} L{level:>2}  acc={acc:.3f}  n={total}")
-    out_report_path = ensure_output_path(out_report_path)
+
+    ensure_output_path(out_report_path)
     with open(out_report_path, "w") as f:
         json.dump(report, f, indent=2)
 
@@ -252,35 +265,48 @@ Original problem:
 """
 
 
-def generate_semantic_perturbations(weak_report: list, math_rows: list, generator_fn,
-                                     out_path: str, n_per_problem: int = 2):
+def generate_semantic_perturbations(weak_report: list, math_rows: list, batch_generate_fn,
+                                     out_path: str, n_per_problem: int = 2, batch_size: int = 128):
     """
-    generator_fn: callable(prompt: str) -> str
-        Plug in your own model call here (local Qwen2.5-Math-7B via vLLM/HF generate,
-        or any other model you have access to). Kept pluggable so this script has no
-        hard dependency on a specific serving stack.
+    batch_generate_fn: callable(prompts: list[str]) -> list[str]
+        One completion per prompt, called on a BATCH of prompts at once - this is what
+        actually gives you vLLM's continuous-batching throughput. Looping a single-prompt
+        generate() call once per problem pays engine scheduling overhead thousands of
+        times over and is dramatically slower than a handful of large batched calls.
     """
     weak_keys = {(r["subject"], r["level"]) for r in weak_report}
     targets = [row for row in math_rows if (row["subject"], str(row.get("level", "unknown"))) in weak_keys]
     print(f"[augment-semantic] {len(targets)} source problems in weak clusters")
 
-    out = []
+    jobs = []  # (row, prompt_text)
     for row in targets:
         for _ in range(n_per_problem):
-            prompt = SEMANTIC_PERTURB_PROMPT.format(problem=row["problem"])
-            rewritten = generator_fn(prompt).strip()
-            if not rewritten or rewritten == row["problem"]:
-                continue
-            out.append({
-                "problem_id": _hash_problem(rewritten),
-                "source_problem_id": row["problem_id"],
-                "subject": row["subject"],
-                "level": row.get("level", "unknown"),
-                "problem": rewritten,
-                "solution": row["solution"],  # gold answer unchanged: meaning-preserving
-                "augmentation": "semantic_perturbation",
-            })
-    out_path = ensure_output_path(out_path)
+            jobs.append((row, SEMANTIC_PERTURB_PROMPT.format(problem=row["problem"])))
+
+    print(f"[augment-semantic] generating {len(jobs)} perturbations in batches of {batch_size} "
+          f"({(len(jobs) + batch_size - 1) // batch_size} model calls total, not {len(jobs)})")
+    completions = []
+    for i in range(0, len(jobs), batch_size):
+        batch_prompts = [p for _, p in jobs[i:i + batch_size]]
+        completions.extend(batch_generate_fn(batch_prompts))
+        print(f"[augment-semantic] {min(i + batch_size, len(jobs))}/{len(jobs)} generated")
+
+    out = []
+    for (row, _), rewritten in zip(jobs, completions):
+        rewritten = (rewritten or "").strip()
+        if not rewritten or rewritten == row["problem"]:
+            continue
+        out.append({
+            "problem_id": _hash_problem(rewritten),
+            "source_problem_id": row["problem_id"],
+            "subject": row["subject"],
+            "level": row.get("level", "unknown"),
+            "problem": rewritten,
+            "solution": row["solution"],  # gold answer unchanged: meaning-preserving
+            "augmentation": "semantic_perturbation",
+        })
+
+    ensure_output_path(out_path)
     with open(out_path, "w") as f:
         for ex in out:
             f.write(json.dumps(ex) + "\n")
@@ -289,12 +315,7 @@ def generate_semantic_perturbations(weak_report: list, math_rows: list, generato
 
 # ---------------------------------------------------------------------------
 # Numeric perturbation (secondary): only applied where the answer can be
-# independently re-verified. Two verification paths:
-#   1. sympy recomputation, when the problem's solution is a closed-form
-#      expression you can reparametrize (you supply a `recompute_fn` per template).
-#   2. self-consistency vote: sample the *current* model N times on the
-#      perturbed problem and only keep it if a strong majority agree AND
-#      that majority also matches an independently sampled "solver" pass.
+# independently re-verified via a self-consistency vote.
 # ---------------------------------------------------------------------------
 
 NUMERIC_LITERAL_RE = re.compile(r"(?<![\w.])(-?\d+(?:\.\d+)?)(?![\w.])")
@@ -319,13 +340,16 @@ def perturb_numeric_literals(problem: str, rng, scale_range=(0.5, 2.0)):
     return new_problem, changed
 
 
-def generate_numeric_perturbations(weak_report: list, math_rows: list, solver_fn,
+def generate_numeric_perturbations(weak_report: list, math_rows: list, batch_solver_fn,
                                     out_path: str, n_per_problem: int = 2,
                                     votes: int = 5, agreement_threshold: float = 0.8,
-                                    seed: int = 0):
+                                    seed: int = 0, batch_size: int = 64):
     """
-    solver_fn: callable(problem: str) -> str (a full solution with \\boxed{...})
-        Used to independently re-derive the answer for the perturbed numbers.
+    batch_solver_fn: callable(problems: list[str], votes: int) -> list[list[str]]
+        Returns `votes` independently-sampled full solutions (each with \\boxed{...})
+        PER PROBLEM, for a BATCH of problems at once - implemented via vLLM's n=votes
+        sampling parameter under the hood, so every vote for every problem comes back
+        in one engine call instead of `votes * n_problems` separate single-prompt calls.
     Only accepted if >= agreement_threshold of `votes` independent solver calls agree
     on the same boxed answer (self-consistency gate) - this is the verification step
     that makes numeric perturbation safe to include in training data.
@@ -336,18 +360,27 @@ def generate_numeric_perturbations(weak_report: list, math_rows: list, solver_fn
     targets = [row for row in math_rows if (row["subject"], str(row.get("level", "unknown"))) in weak_keys]
     print(f"[augment-numeric] {len(targets)} source problems in weak clusters")
 
-    accepted, rejected = 0, 0
-    out = []
+    jobs = []  # (row, new_problem, changed)
     for row in targets:
         for _ in range(n_per_problem):
             new_problem, changed = perturb_numeric_literals(row["problem"], rng)
-            if not changed:
-                continue
+            if changed:
+                jobs.append((row, new_problem, changed))
 
+    print(f"[augment-numeric] verifying {len(jobs)} perturbed problems in batches of "
+          f"{batch_size} ({(len(jobs) + batch_size - 1) // batch_size} model calls total, "
+          f"each returning {votes} votes per problem)")
+
+    accepted, rejected = 0, 0
+    out = []
+    for i in range(0, len(jobs), batch_size):
+        batch = jobs[i:i + batch_size]
+        batch_problems = [p for _, p, _ in batch]
+        batch_votes = batch_solver_fn(batch_problems, votes)  # list[list[str]]
+        for (row, new_problem, changed), sols in zip(batch, batch_votes):
             votes_seen = defaultdict(int)
             solutions_by_answer = {}
-            for _ in range(votes):
-                sol = solver_fn(new_problem)
+            for sol in sols:
                 ans = extract_boxed(sol)
                 if ans is None:
                     continue
@@ -375,10 +408,12 @@ def generate_numeric_perturbations(weak_report: list, math_rows: list, solver_fn
                 "self_consistency": best_count / votes,
                 "augmentation": "numeric_perturbation",
             })
+        print(f"[augment-numeric] {min(i + batch_size, len(jobs))}/{len(jobs)} verified "
+              f"(accepted={accepted} rejected={rejected})")
 
     print(f"[augment-numeric] accepted={accepted} rejected={rejected} "
           f"(agreement threshold={agreement_threshold})")
-    out_path = ensure_output_path(out_path)
+    ensure_output_path(out_path)
     with open(out_path, "w") as f:
         for ex in out:
             f.write(json.dumps(ex) + "\n")
@@ -396,50 +431,58 @@ def _solution_signature(solution_text: str) -> str:
     return hashlib.sha256(" ".join(sig_lines).encode()).hexdigest()[:12]
 
 
-def generate_multi_solutions(weak_report: list, math_rows: list, sampler_fn,
+def generate_multi_solutions(weak_report: list, math_rows: list, batch_sampler_fn,
                               out_path: str, n_samples: int = 16, keep_top_k: int = 3,
-                              temperature: float = 0.9):
+                              temperature: float = 0.9, batch_size: int = 32):
     """
-    sampler_fn: callable(problem: str, n: int, temperature: float) -> list[str]
-        Returns n sampled completions (each containing a full solution + \\boxed{}).
+    batch_sampler_fn: callable(problems: list[str], n: int, temperature: float) -> list[list[str]]
+        Returns n sampled completions per problem, for a BATCH of problems at once.
     Keeps up to keep_top_k solutions per problem that (a) match the gold answer and
     (b) are structurally distinct from each other (different equation signature).
     """
     weak_keys = {(r["subject"], r["level"]) for r in weak_report}
     targets = [row for row in math_rows if (row["subject"], str(row.get("level", "unknown"))) in weak_keys]
+    targets = [row for row in targets if extract_boxed(row["solution"]) is not None]
     print(f"[multi-solution] {len(targets)} source problems in weak clusters")
+    print(f"[multi-solution] sampling in batches of {batch_size} "
+          f"({(len(targets) + batch_size - 1) // batch_size} model calls total, "
+          f"each returning {n_samples} samples per problem)")
 
     out = []
-    for row in targets:
-        gold = extract_boxed(row["solution"])
-        if gold is None:
-            continue
-        samples = sampler_fn(row["problem"], n_samples, temperature)
-        seen_sigs = set()
-        kept = []
-        for s in samples:
-            pred = extract_boxed(s)
-            if pred is None or not answers_match(pred, gold):
-                continue
-            sig = _solution_signature(s)
-            if sig in seen_sigs:
-                continue
-            seen_sigs.add(sig)
-            kept.append(s)
-            if len(kept) >= keep_top_k:
-                break
+    for i in range(0, len(targets), batch_size):
+        batch = targets[i:i + batch_size]
+        batch_problems = [row["problem"] for row in batch]
+        batch_samples = batch_sampler_fn(batch_problems, n_samples, temperature)
 
-        for i, sol in enumerate(kept):
-            out.append({
-                "problem_id": row["problem_id"],
-                "subject": row["subject"],
-                "level": row.get("level", "unknown"),
-                "problem": row["problem"],
-                "solution": sol,
-                "variant_index": i,
-                "augmentation": "multi_solution_rejection_sampling",
-            })
-    out_path = ensure_output_path(out_path)
+        for row, samples in zip(batch, batch_samples):
+            gold = extract_boxed(row["solution"])
+            seen_sigs = set()
+            kept = []
+            for s in samples:
+                pred = extract_boxed(s)
+                if pred is None or not answers_match(pred, gold):
+                    continue
+                sig = _solution_signature(s)
+                if sig in seen_sigs:
+                    continue
+                seen_sigs.add(sig)
+                kept.append(s)
+                if len(kept) >= keep_top_k:
+                    break
+
+            for vi, sol in enumerate(kept):
+                out.append({
+                    "problem_id": row["problem_id"],
+                    "subject": row["subject"],
+                    "level": row.get("level", "unknown"),
+                    "problem": row["problem"],
+                    "solution": sol,
+                    "variant_index": vi,
+                    "augmentation": "multi_solution_rejection_sampling",
+                })
+        print(f"[multi-solution] {min(i + batch_size, len(targets))}/{len(targets)} problems sampled")
+
+    ensure_output_path(out_path)
     with open(out_path, "w") as f:
         for ex in out:
             f.write(json.dumps(ex) + "\n")
@@ -454,11 +497,15 @@ if __name__ == "__main__":
     ap.add_argument("--augment-numeric", action="store_true")
     ap.add_argument("--multi-solution", action="store_true")
 
-    # ap.add_argument("--skill-labels", type=str, default="skill_labels.jsonl")
+    ap.add_argument("--skill-repo", type=str, default=DEFAULT_SKILL_REPO,
+                     help="Hugging Face Hub dataset repo id for skill labels")
+    ap.add_argument("--skill-labels-file", type=str, default=None,
+                     help="optional local jsonl/csv override instead of --skill-repo")
     ap.add_argument("--split", type=str, default="train")
     ap.add_argument("--out", type=str, default="outputs/sft_data.jsonl")
     ap.add_argument("--predictions", type=str, default="outputs/predictions.jsonl")
     ap.add_argument("--weak-report", type=str, default="outputs/weak_clusters.json")
+    add_destination_args(ap, default_repo_type="dataset")
 
     args = ap.parse_args()
 
@@ -466,11 +513,16 @@ if __name__ == "__main__":
         build_sft_dataset(
             out_path=args.out,
             split=args.split,
+            skill_repo=args.skill_repo,
+            skill_labels_file=args.skill_labels_file,
         )
+        dispatch_destination(args.out, args)
     elif args.diagnose:
         diagnose(args.predictions, args.weak_report)
+        dispatch_destination(args.weak_report, args)
     else:
         print("Semantic / numeric / multi-solution augmentation require you to pass a "
               "generator_fn / solver_fn / sampler_fn (a live model call) - import this "
               "module and call the functions directly from a script where your model "
-              "is loaded, rather than running this file standalone for those stages.")
+              "is loaded (see run_augmentation.py), rather than running this file "
+              "standalone for those stages.")
