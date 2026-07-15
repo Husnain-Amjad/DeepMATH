@@ -23,11 +23,11 @@ import random
 
 import torch
 from datasets import Dataset, concatenate_datasets
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, TrainerCallback
 from trl import SFTTrainer, SFTConfig
 
 from determinism import set_all_seeds
-from storage_utils import ensure_dir, add_destination_args, dispatch_destination
+from storage_utils import ensure_dir, add_destination_args, dispatch_destination, push_to_hf
 
 # ---------------------------------------------------------------------------
 # ROCm / CUDA portability notes:
@@ -51,6 +51,60 @@ def is_rocm() -> bool:
 def best_attn_implementation() -> str:
     """sdpa is portable across CUDA and ROCm; flash_attention_2 is CUDA-only."""
     return "sdpa"
+
+
+def find_latest_checkpoint(output_dir):
+    """Returns the checkpoint-N directory with the highest N under output_dir, or None."""
+    if not os.path.isdir(output_dir):
+        return None
+    ckpts = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")]
+    if not ckpts:
+        return None
+
+    def step_num(d):
+        try:
+            return int(d.split("-")[-1])
+        except ValueError:
+            return -1
+
+    ckpts.sort(key=step_num)
+    return os.path.join(output_dir, ckpts[-1])
+
+
+class PushCheckpointCallback(TrainerCallback):
+    """
+    Pushes each RAW checkpoint (adapter-only for LoRA, full weights for full-FT -
+    exactly what the Trainer just wrote to disk) to a distinct subfolder of the HF
+    repo as soon as it's saved. Deliberately does NOT touch trainer.model or merge
+    anything here: merge_and_unload() mutates the live model in place and would
+    corrupt the ongoing training state if called mid-run, and loading a second
+    full copy of the base model to merge separately would risk OOM on a single
+    GPU that's already holding the training run. Merging happens later, decoupled,
+    via merge_lora.py or run_multi_checkpoint_eval.py.
+    """
+    def __init__(self, hf_repo_id, hf_repo_type, hf_private, hf_token):
+        self.hf_repo_id = hf_repo_id
+        self.hf_repo_type = hf_repo_type
+        self.hf_private = hf_private
+        self.hf_token = hf_token
+
+    def on_save(self, args, state, control, **kwargs):
+        ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if not os.path.isdir(ckpt_dir):
+            print(f"[push-checkpoint] expected {ckpt_dir} after save but it's missing - skipping push")
+            return control
+        label = f"checkpoint-{state.global_step}"
+        try:
+            push_to_hf(ckpt_dir, self.hf_repo_id, repo_type=self.hf_repo_type,
+                       private=self.hf_private, path_in_repo=label, token=self.hf_token,
+                       commit_message=f"{label} (epoch={state.epoch:.2f})")
+        except Exception as e:
+            print(f"[push-checkpoint] WARNING: push failed for {label} "
+                  f"({type(e).__name__}: {e}) - training continues; push it manually "
+                  f"later with push_artifact.py --path {ckpt_dir} --push_to hf "
+                  f"--hf_repo_id {self.hf_repo_id} --hf_repo_type {self.hf_repo_type} "
+                  f"--hf_path_in_repo {label}")
+        return control
 
 
 def load_jsonl_as_dataset(paths, text_field="text"):
@@ -141,8 +195,32 @@ def main():
                      help="skip the automatic LoRA merge-and-save step (mode=lora only). "
                           "Use if you specifically want to keep only the adapter, e.g. "
                           "for vLLM's --enable-lora serving mode instead of a merged model.")
+    ap.add_argument("--save_every_epochs", type=float, default=None,
+                     help="checkpoint every N epochs (e.g. 0.5) instead of the default "
+                          "once-per-epoch. Computed from the ACTUAL post-packing dataloader "
+                          "length, not an analytical estimate, since --packing changes how "
+                          "many optimizer steps an epoch actually takes.")
+    ap.add_argument("--save_total_limit", type=int, default=None,
+                     help="cap on local checkpoints kept on disk (HF Trainer deletes "
+                          "older ones). Recommended alongside --push_every_checkpoint on "
+                          "disk-constrained/ephemeral environments, since older ones are "
+                          "already safe on HF once pushed.")
+    ap.add_argument("--push_every_checkpoint", action="store_true", default=False,
+                     help="push each raw checkpoint to --hf_repo_id as it's saved, under "
+                          "a distinct subfolder per checkpoint - protects progress if the "
+                          "session dies mid-run. Requires --push_to hf and --hf_repo_id.")
+    ap.add_argument("--resume_from_checkpoint", type=str, default=None,
+                     help="'auto' to resume from the latest checkpoint-N under --output_dir "
+                          "if one exists, or an explicit checkpoint directory path. Omit to "
+                          "start fresh. If your local disk was wiped (ephemeral session) "
+                          "but you pushed checkpoints to HF, download the desired one first "
+                          "(see TUTORIAL.md) then pass its local path here.")
     add_destination_args(ap, default_repo_type="model")
     args = ap.parse_args()
+
+    if args.push_every_checkpoint and (args.push_to != "hf" or not args.hf_repo_id):
+        raise SystemExit("[sft_train] --push_every_checkpoint requires --push_to hf "
+                          "and --hf_repo_id (checked before training starts, not after).")
 
     set_all_seeds(args.seed, strict_deterministic=args.strict_deterministic)
     torch.backends.cuda.matmul.allow_tf32 = True  # no-op on ROCm, free speedup on CUDA
@@ -202,8 +280,9 @@ def main():
         seed=args.seed,
         data_seed=args.seed,
         logging_steps=10,
-        save_strategy="epoch",
-        max_length=args.max_seq_len,
+        save_strategy="epoch" if args.save_every_epochs is None else "steps",
+        save_total_limit=args.save_total_limit,
+        max_seq_length=args.max_seq_len,
         packing=args.packing,  # TRL packs with EOS-bounded loss masking, so
                                 # <think>/<solution> boundaries stay intact even packed
         gradient_checkpointing=True,
@@ -217,8 +296,41 @@ def main():
         processing_class=tokenizer,
         peft_config=peft_config,
     )
+
+    if args.save_every_epochs is not None:
+        # Measure the ACTUAL post-packing dataloader length rather than estimating
+        # analytically - --packing changes how many examples become one training
+        # sequence, so len(train_ds) alone doesn't tell you steps-per-epoch.
+        n_batches_per_epoch = len(trainer.get_train_dataloader())
+        steps_per_epoch = max(1, n_batches_per_epoch // args.grad_accum)
+        save_steps = max(1, round(args.save_every_epochs * steps_per_epoch))
+        trainer.args.save_steps = save_steps
+        print(f"[sft_train] measured {n_batches_per_epoch} batches/epoch -> "
+              f"{steps_per_epoch} optimizer steps/epoch -> checkpointing every "
+              f"{save_steps} steps (~{args.save_every_epochs} epoch)")
+
+    if args.push_every_checkpoint:
+        trainer.add_callback(PushCheckpointCallback(
+            hf_repo_id=args.hf_repo_id, hf_repo_type=args.hf_repo_type,
+            hf_private=args.hf_private, hf_token=args.hf_token,
+        ))
+        print(f"[sft_train] will push each checkpoint to hf://{args.hf_repo_id} "
+              f"under its own checkpoint-N subfolder as training progresses")
+
+    resume_path = None
+    if args.resume_from_checkpoint == "auto":
+        resume_path = find_latest_checkpoint(args.output_dir)
+        if resume_path:
+            print(f"[sft_train] --resume_from_checkpoint auto -> resuming from {resume_path}")
+        else:
+            print(f"[sft_train] --resume_from_checkpoint auto but no checkpoint-N found "
+                  f"under {args.output_dir} - starting fresh")
+    elif args.resume_from_checkpoint:
+        resume_path = args.resume_from_checkpoint
+        print(f"[sft_train] resuming from explicit checkpoint: {resume_path}")
+
     ensure_dir(args.output_dir)
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_path)
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     print(f"[sft_train] saved to {args.output_dir}")
