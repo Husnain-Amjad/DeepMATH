@@ -1,0 +1,25 @@
+# Accelerate config for multi-GPU LoRA fine-tuning via plain DDP (Distributed
+# Data Parallel) - LoRA's trainable parameter count is small enough that full
+# FSDP sharding usually isn't necessary; DDP (each GPU holds a full copy of the
+# LoRA adapter + frozen base weights, only gradients/data are distributed) is
+# simpler and typically just as fast for --mode lora.
+#
+# Usage:
+#   accelerate launch --config_file cluster_configs/accelerate_ddp_lora.yaml \
+#       sft_train.py --model Qwen/Qwen2.5-Math-7B --data outputs/sft_data.jsonl \
+#       --mode lora --output_dir ckpts/qwen7b_lora_cluster
+#
+# Edit num_processes below to match your actual GPU count on this node.
+
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+mixed_precision: bf16
+num_machines: 1
+num_processes: 4          # <-- EDIT: set to your actual GPU count on this node
+main_training_function: main
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

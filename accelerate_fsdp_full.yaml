@@ -1,0 +1,34 @@
+# Accelerate config for multi-GPU FULL FINE-TUNING via FSDP (Fully Sharded Data
+# Parallel) - use this when --mode full on a multi-GPU node/cluster, since full
+# fine-tuning of a 7B+ model needs the optimizer states and gradients SHARDED
+# across GPUs, not just the data batches.
+#
+# Usage:
+#   accelerate launch --config_file cluster_configs/accelerate_fsdp_full.yaml \
+#       sft_train.py --model Qwen/Qwen2.5-Math-7B --data outputs/sft_data.jsonl \
+#       --mode full --output_dir ckpts/qwen7b_full_cluster
+#
+# Edit num_processes below to match your actual GPU count on this node.
+
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_forward_prefetch: false
+  fsdp_offload_params: false
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_sync_module_states: true
+  fsdp_use_orig_params: true
+mixed_precision: bf16
+num_machines: 1
+num_processes: 4          # <-- EDIT: set to your actual GPU count on this node
+main_training_function: main
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

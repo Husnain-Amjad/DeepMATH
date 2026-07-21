@@ -1,23 +1,63 @@
-# ---- Common (both CUDA and ROCm) ----
-transformers>=4.46
-accelerate
-peft
-trl>=0.12
-datasets
-sympy
-antlr4-python3-runtime==4.11
-
-# ---- Backend-specific: install torch/vllm/bitsandbytes separately, see below ----
+# ============================================================================
+# RECOMMENDED: run `python check_environment.py` instead of installing from
+# this file blindly. It reports what's already present (many training images -
+# vendor Docker images, Kaggle/Colab, cluster environment modules - already
+# ship torch/transformers/etc. pinned to versions that work with that specific
+# hardware/driver stack) and only flags what's genuinely missing, rather than
+# forcing a reinstall/upgrade of something already working.
 #
-# CUDA (NVIDIA):
+#   python check_environment.py                  # report only
+#   python check_environment.py --install-missing # also installs genuinely
+#                                                   # absent core packages
+#
+# This file remains as a plain fallback for `pip install -r requirements.txt`
+# if you'd rather not use the checker, or for reproducing an exact environment
+# from a lockfile-style pin (see the bottom of this file).
+# ============================================================================
+
+# ---- Common (both CUDA and ROCm) - minimum versions, not exact pins ----
+# check_environment.py treats these as floors: already-installed packages at
+# or above these versions are left completely alone.
+transformers>=4.46
+accelerate>=0.34
+peft>=0.13
+trl>=0.12
+datasets>=2.20
+sympy>=1.12
+matplotlib>=3.7
+huggingface_hub>=0.25
+antlr4-python3-runtime==4.11  # exact pin: required by sympy's latex parser, known-fragile across versions
+
+# ---- Backend-specific: NEVER installed by `pip install -r requirements.txt`
+# alone - torch/vllm/bitsandbytes all depend on which hardware you're on, and
+# guessing wrong here is worse than not installing at all. Use one of the
+# blocks below, or just run check_environment.py which prints the same
+# guidance in context. ----
+#
+# --- NVIDIA CUDA (A100 / H100 / other CUDA GPUs) ---
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 #   pip install vllm
 #   pip install bitsandbytes          # optional, enables --use_bnb 4-bit QLoRA
 #
-# ROCm (AMD, e.g. MI210/MI250/MI300):
+# --- AMD ROCm (MI210 / MI250 / MI300) ---
 #   pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
-#   # vLLM on ROCm is NOT a plain `pip install vllm` - use AMD's ROCm vLLM
-#   # docker image, or build from source per: https://docs.vllm.ai/en/latest/getting_started/amd-installation.html
-#   # If you skip vLLM, grpo_train.py automatically falls back to the slower
-#   # HF-generate rollout backend - still correct, just lower throughput.
-#   # bitsandbytes: skip it (--use_bnb is auto-disabled on ROCm in these scripts).
+#   # vLLM on ROCm is NOT a plain `pip install vllm` - see ROCM_TUTORIAL.md Step 3.
+#   # If skipped, run_eval.py/run_augmentation.py fall back automatically to the
+#   # slower HF-generate rollout backend - still correct, just lower throughput.
+#   # bitsandbytes: skip it - --use_bnb auto-disables itself on ROCm regardless.
+#
+# --- Multi-GPU / cluster (either backend) ---
+# Same torch/vllm install as above, PLUS:
+#   pip install accelerate>=0.34   # already listed above, called out again since
+#                                    # cluster launches specifically need `accelerate launch`
+# See CLUSTER_TUTORIAL.md and cluster_configs/*.yaml for the actual launch commands.
+
+# ============================================================================
+# EXACT-PIN LOCKFILE (optional): if you need a byte-for-byte reproducible
+# environment for a specific paper run rather than "any compatible version",
+# generate one AFTER setting up a working environment with:
+#   pip freeze > requirements.lock.txt
+# and install that instead in future. Not shipped here since the "right"
+# exact versions are hardware-dependent (see check_environment.py's hardware
+# report) and would need updating per target machine anyway.
+# ============================================================================
