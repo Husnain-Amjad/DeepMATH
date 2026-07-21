@@ -12,10 +12,11 @@ import argparse
 import json
 
 import data_pipeline as dp
-from run_augmentation import build_backend, MATH_PROMPT_TEMPLATE
+from run_augmentation import build_backend
 from reward_fn import extract_boxed
 from determinism import set_all_seeds
 from storage_utils import ensure_output_path, add_destination_args, dispatch_destination
+from templates import render_prompt_only
 
 
 def main():
@@ -39,7 +40,7 @@ def main():
     print(f"[run_eval] evaluating on {len(math_rows)} problems ({args.split} split)")
 
     backend = build_backend(args.model, args.use_vllm, seed=args.seed)
-    prompts = [MATH_PROMPT_TEMPLATE.format(problem=r["problem"]) for r in math_rows]
+    prompts = [render_prompt_only(backend.tokenizer, r["problem"]) for r in math_rows]
 
     # batch through vLLM in one call if available; HF backend loops internally
     completions = backend.generate(prompts, n=1, temperature=0.0, max_tokens=args.max_tokens)

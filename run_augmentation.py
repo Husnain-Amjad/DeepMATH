@@ -28,18 +28,7 @@ import os
 
 import data_pipeline as dp
 from storage_utils import add_destination_args, dispatch_destination
-
-MATH_PROMPT_TEMPLATE = (
-    "<|im_start|>system\nYou are a careful mathematical problem solver. "
-    "First think through the problem's structure, then solve it.<|im_end|>\n"
-    "<|im_start|>user\n{problem}<|im_end|>\n"
-    "<|im_start|>assistant\n"
-)
-GENERIC_PROMPT_TEMPLATE = (
-    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-    "<|im_start|>user\n{instruction}<|im_end|>\n"
-    "<|im_start|>assistant\n"
-)
+from templates import render_prompt_only, DEFAULT_SYSTEM_PROMPT
 
 
 def vllm_available() -> bool:
@@ -107,8 +96,13 @@ def resolve_model_path(model_path: str) -> str:
 class VLLMBackend:
     def __init__(self, model_path, max_model_len=4096, seed=42):
         from vllm import LLM
+        from transformers import AutoTokenizer
         self.llm = LLM(model=model_path, max_model_len=max_model_len,
                         dtype="bfloat16", seed=seed)
+        # Loaded separately (not via vllm's internal API) so this stays stable
+        # across vLLM versions - this is what lets us render this model's own
+        # chat template for prompts instead of a hardcoded one.
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     def generate(self, prompts, n=1, temperature=0.7, max_tokens=1024):
         from vllm import SamplingParams
@@ -202,7 +196,8 @@ def main():
 
     if args.stage == "semantic":
         def batch_generate_fn(prompts):
-            formatted = [GENERIC_PROMPT_TEMPLATE.format(instruction=p) for p in prompts]
+            formatted = [render_prompt_only(backend.tokenizer, p, system_prompt="You are a helpful assistant.")
+                         for p in prompts]
             results = backend.generate(formatted, n=1, temperature=0.8, max_tokens=512)
             return [r[0] for r in results]
 
@@ -214,7 +209,7 @@ def main():
 
     elif args.stage == "numeric":
         def batch_solver_fn(problems, votes):
-            formatted = [MATH_PROMPT_TEMPLATE.format(problem=p) for p in problems]
+            formatted = [render_prompt_only(backend.tokenizer, p) for p in problems]
             return backend.generate(formatted, n=votes, temperature=0.7, max_tokens=1024)
 
         dp.generate_numeric_perturbations(
@@ -226,7 +221,7 @@ def main():
 
     elif args.stage == "multi_solution":
         def batch_sampler_fn(problems, n, temperature):
-            formatted = [MATH_PROMPT_TEMPLATE.format(problem=p) for p in problems]
+            formatted = [render_prompt_only(backend.tokenizer, p) for p in problems]
             return backend.generate(formatted, n=n, temperature=temperature, max_tokens=1024)
 
         dp.generate_multi_solutions(

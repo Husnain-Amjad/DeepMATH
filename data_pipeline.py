@@ -38,14 +38,6 @@ SUBJECTS = [
     "number_theory", "prealgebra", "precalculus",
 ]
 
-CHAT_TEMPLATE = (
-    "<|im_start|>system\nYou are a careful mathematical problem solver. "
-    "First think through the problem's structure, then solve it.<|im_end|>\n"
-    "<|im_start|>user\n{problem}<|im_end|>\n"
-    "<|im_start|>assistant\n<think>\n{think}\n</think>\n<solution>\n{solution}\n</solution><|im_end|>"
-)
-
-_SKILL_TAG_RE = re.compile(r"\[SKILL:\s*([^\]]+)\]")
 _ANSWER_LINE_RE = re.compile(r"\n?ANSWER:\s*\\boxed\{.*?\}\s*$", re.IGNORECASE | re.DOTALL)
 _MINIMUM_SKILLS_PREFIX_RE = re.compile(r"^\s*MINIMUM_SKILLS:\s*", re.IGNORECASE)
 
@@ -156,16 +148,17 @@ def build_sft_dataset(out_path: str, split: str = "train",
         if gold is None:
             continue  # can't supervise without a checkable answer
         think = build_think_section(row)
-        text = CHAT_TEMPLATE.format(
-            problem=row["problem"], think=think, solution=original_solution
-        )
+        skill_list = clean_skill_list(row.get("minimum_skills", "")) or row.get("skills_used_in_steps", "")
         examples.append({
             "problem_id": pid,
             "subject": row.get("subject", "unknown"),
             "level": row.get("level", "unknown"),
-            "text": text,
+            "problem": row["problem"],
+            "think": think,
+            "solution": original_solution,
             "gold_boxed": gold,
             "n_skills": row.get("n_skills"),
+            "skills": skill_list,
             "source": "skill_labeled",
         })
 
@@ -180,16 +173,16 @@ def build_sft_dataset(out_path: str, split: str = "train",
             if gold is None:
                 continue
             think = f"Relevant skills: (not yet labeled, subject={row['subject']})"
-            text = CHAT_TEMPLATE.format(
-                problem=row["problem"], think=think, solution=row["solution"]
-            )
             examples.append({
                 "problem_id": row["problem_id"],
                 "subject": row["subject"],
                 "level": row.get("level", "unknown"),
-                "text": text,
+                "problem": row["problem"],
+                "think": think,
+                "solution": row["solution"],
                 "gold_boxed": gold,
                 "n_skills": None,
+                "skills": "",
                 "source": "unlabeled_fallback",
             })
             n_fallback += 1

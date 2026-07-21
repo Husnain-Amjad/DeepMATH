@@ -21,8 +21,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
 from reward_fn import score_completion, extract_boxed
+from evaluator import parse_model_output, arithmetic_consistency_score
 from determinism import set_all_seeds
 from storage_utils import ensure_dir, add_destination_args, dispatch_destination
+from templates import render_prompt_only
 
 # ---------------------------------------------------------------------------
 # ROCm notes:
@@ -48,11 +50,13 @@ def is_rocm() -> bool:
     return torch.cuda.is_available() and bool(getattr(torch.version, "hip", None))
 
 
-def load_grpo_prompts(path):
+def load_grpo_prompts(path, tokenizer):
     """
-    Builds the RL prompt set from the same jsonl used for SFT, but strips the
-    <think>/<solution> assistant turn - GRPO needs prompts only, the model
-    generates its own completion which gets scored by reward_fn.
+    Builds the RL prompt set directly from the raw {problem, subject, level,
+    gold_boxed} jsonl using this run's own tokenizer/template (templates.py) -
+    correct per-model, and no longer needs to string-search a baked chat
+    template that doesn't exist in the data anymore (build_sft_dataset now
+    stores raw fields, not a pre-rendered "text" column - see data_pipeline.py).
     """
     rows = []
     with open(path) as f:
@@ -60,11 +64,7 @@ def load_grpo_prompts(path):
             if not line.strip():
                 continue
             obj = json.loads(line)
-            # reconstruct the user-turn-only prompt (everything up to and
-            # including "<|im_start|>assistant\n")
-            text = obj["text"]
-            cut = text.find("<|im_start|>assistant")
-            prompt = text[:cut] + "<|im_start|>assistant\n"
+            prompt = render_prompt_only(tokenizer, obj["problem"])
             rows.append({
                 "prompt": prompt,
                 "gold_boxed": obj["gold_boxed"],
@@ -74,41 +74,69 @@ def load_grpo_prompts(path):
     return Dataset.from_list(rows)
 
 
-def make_reward_function():
-    """
-    TRL's GRPOTrainer calls the reward function with the batch of completions
-    and passes through any extra dataset columns as kwargs (here: gold_boxed).
-    Returns a list of float rewards, one per completion.
-    """
-    def reward_fn(completions, gold_boxed, **kwargs):
-        rewards = []
-        for completion, gold in zip(completions, gold_boxed):
-            # completion may be a list of chat turns (dict) or plain string
-            text = completion if isinstance(completion, str) else completion[-1]["content"]
-            rewards.append(score_completion(text, gold))
-        return rewards
-
-    return reward_fn
+def _completion_text(completion):
+    """completion may be a list of chat turns (dict) or a plain string, depending on TRL version."""
+    return completion if isinstance(completion, str) else completion[-1]["content"]
 
 
-def format_length_penalty(completions, **kwargs):
+def correctness_reward_fn(completions, gold_boxed, **kwargs):
+    """1.0 correct boxed answer, 0.1 wrong-but-well-formatted, 0.0 no boxed answer at all."""
+    return [score_completion(_completion_text(c), g) for c, g in zip(completions, gold_boxed)]
+
+
+def format_reward_fn(completions, **kwargs):
     """
-    Optional secondary reward: mild penalty for pathologically short completions
-    that skip reasoning (e.g. just emitting \\boxed{...} with no derivation) or
-    for completions that never close a boxed answer at all. Kept small relative
-    to correctness reward so it shapes behavior without dominating it.
+    Format fidelity: 0.5 for having a <think> section, 0.5 for having a resolvable
+    boxed answer - reuses evaluator.py's own parser so 'has the model learned the
+    trained format' is scored identically here and at evaluation time.
     """
     rewards = []
     for completion in completions:
-        text = completion if isinstance(completion, str) else completion[-1]["content"]
-        has_box = extract_boxed(text) is not None
-        n_tokens_approx = len(text.split())
-        penalty = 0.0
-        if not has_box:
-            penalty -= 0.2
-        if n_tokens_approx < 15:
-            penalty -= 0.1
-        rewards.append(penalty)
+        parsed = parse_model_output(_completion_text(completion))
+        r = (0.5 if parsed["has_think"] else 0.0) + (0.5 if parsed["has_boxed"] else 0.0)
+        rewards.append(r)
+    return rewards
+
+
+def persistence_reward_fn(completions, **kwargs):
+    """
+    Persistence: rewards committing to ONE final answer rather than flip-flopping
+    between several different \\boxed{...} values within a single completion - a
+    proxy for not abandoning/reversing a derivation mid-trace. 1.0 for exactly one
+    distinct boxed value, 0.0 for none, an increasing penalty for each additional
+    distinct value beyond the first.
+    """
+    rewards = []
+    for completion in completions:
+        text = _completion_text(completion)
+        boxed_vals = {v.strip() for v in re.findall(r"\\boxed\{(.*?)\}", text)}
+        if len(boxed_vals) == 0:
+            rewards.append(0.0)
+        elif len(boxed_vals) == 1:
+            rewards.append(1.0)
+        else:
+            rewards.append(max(-1.0, -0.3 * (len(boxed_vals) - 1)))
+    return rewards
+
+
+def chain_stability_reward_fn(completions, **kwargs):
+    """
+    Chain stability: reuses evaluator.py's rule-based arithmetic-consistency proxy
+    (symbolic verification of extractable 'A = B' step assertions) as a per-step
+    validity signal - the fraction of checkable assertions verified true. Returns
+    a neutral 0.5 when a completion has no checkable assertions at all, rather than
+    0.0, so purely-verbal-but-correct reasoning isn't penalized for not containing
+    an equation to check.
+    """
+    rewards = []
+    for completion in completions:
+        parsed = parse_model_output(_completion_text(completion))
+        n_checkable, n_correct = 0, 0
+        for _, step_text in parsed["steps"]:
+            nc, ncorr = arithmetic_consistency_score(step_text)
+            n_checkable += nc
+            n_correct += ncorr
+        rewards.append((n_correct / n_checkable) if n_checkable else 0.5)
     return rewards
 
 
@@ -130,6 +158,16 @@ def main():
     ap.add_argument("--beta", type=float, default=0.0,
                      help="KL penalty coefficient. 0.0 matches DAPO-style GRPO "
                           "(no KL term); set >0 for vanilla GRPO stability.")
+    ap.add_argument("--w_correctness", type=float, default=1.0,
+                     help="weight for the correctness reward component")
+    ap.add_argument("--w_format", type=float, default=0.2,
+                     help="weight for the format-fidelity reward component (<think>/boxed)")
+    ap.add_argument("--w_persistence", type=float, default=0.15,
+                     help="weight for the persistence reward component (commits to one "
+                          "final answer rather than flip-flopping between several)")
+    ap.add_argument("--w_chain_stability", type=float, default=0.25,
+                     help="weight for the chain-stability reward component (rule-based "
+                          "step-level arithmetic consistency, reused from evaluator.py)")
     ap.add_argument("--use_vllm", action="store_true", default=True)
     ap.add_argument("--lora_r", type=int, default=32)
     ap.add_argument("--lora_alpha", type=int, default=64)
@@ -152,11 +190,12 @@ def main():
         args.use_vllm = False
 
     ensure_dir(args.output_dir)
-    train_ds = load_grpo_prompts(args.data)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    train_ds = load_grpo_prompts(args.data, tokenizer)
 
     # Build the model explicitly (rather than passing a bare model-name string
     # to GRPOTrainer) so we control attn_implementation for CUDA/ROCm portability.
@@ -194,10 +233,21 @@ def main():
         report_to=[],
     )
 
+    reward_funcs = [correctness_reward_fn, format_reward_fn, persistence_reward_fn, chain_stability_reward_fn]
+    reward_weights = [args.w_correctness, args.w_format, args.w_persistence, args.w_chain_stability]
+    if hasattr(grpo_config, "reward_weights"):
+        grpo_config.reward_weights = reward_weights
+        print(f"[grpo_train] reward weights (correctness/format/persistence/chain_stability): {reward_weights}")
+    else:
+        print(f"[grpo_train] WARNING: this TRL version's GRPOConfig has no reward_weights "
+              f"field - all {len(reward_funcs)} reward components will be summed with EQUAL "
+              f"weight instead of the requested {reward_weights}. Upgrade trl for weighted "
+              f"multi-component rewards, or fold weighting into a single custom reward_fn.")
+
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
-        reward_funcs=[make_reward_function(), format_length_penalty],
+        reward_funcs=reward_funcs,
         args=grpo_config,
         train_dataset=train_ds,
         peft_config=peft_config,

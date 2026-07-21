@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import random
+from collections import defaultdict
 
 import torch
 from datasets import Dataset, concatenate_datasets
@@ -28,6 +29,7 @@ from trl import SFTTrainer, SFTConfig
 
 from determinism import set_all_seeds
 from storage_utils import ensure_dir, add_destination_args, dispatch_destination, push_to_hf
+from templates import render_sft_example
 
 # ---------------------------------------------------------------------------
 # ROCm / CUDA portability notes:
@@ -107,7 +109,27 @@ class PushCheckpointCallback(TrainerCallback):
         return control
 
 
-def load_jsonl_as_dataset(paths, text_field="text"):
+DEFAULT_THINK_PLACEHOLDER = "Relevant skills: (not labeled - augmented example)"
+
+
+def _normalize_row(obj):
+    """Guarantees the fields templates.py and the replay strategies need are present,
+    regardless of whether this row came from build_sft_dataset (has problem/think/
+    solution/skills) or an augmentation file (semantic/numeric perturbation - has
+    problem/solution only, no think section or skills, since perturbation doesn't
+    regenerate the reasoning trace)."""
+    return {
+        "problem": obj["problem"],
+        "think": obj.get("think") or DEFAULT_THINK_PLACEHOLDER,
+        "solution": obj["solution"],
+        "subject": obj.get("subject", "unknown"),
+        "level": str(obj.get("level", "unknown")),
+        "gold_boxed": obj.get("gold_boxed", ""),
+        "skills": obj.get("skills", ""),
+    }
+
+
+def load_jsonl_as_dataset(paths):
     rows = []
     for p in paths:
         with open(p) as f:
@@ -115,39 +137,103 @@ def load_jsonl_as_dataset(paths, text_field="text"):
                 if not line.strip():
                     continue
                 obj = json.loads(line)
-                if text_field in obj:
-                    rows.append({"text": obj[text_field]})
+                if "problem" in obj and "solution" in obj:
+                    rows.append(_normalize_row(obj))
     return Dataset.from_list(rows)
 
 
-def build_replay_mixed_dataset(original_path, extra_paths, replay_ratio, seed=0):
+def render_dataset_for_model(dataset, tokenizer):
+    """Renders the final 'text' column using this run's OWN tokenizer/template
+    (templates.render_sft_example) - this is what makes one raw sft_data.jsonl
+    reusable across all 7 models instead of baking one hardcoded chat template
+    into the data at build-sft time."""
+    def _render(row):
+        return {"text": render_sft_example(tokenizer, row["problem"], row["think"], row["solution"])}
+    return dataset.map(_render, remove_columns=[c for c in dataset.column_names if c != "text"])
+
+
+def _stratified_sample(dataset, n_target, key_fn, rng):
+    """Round-robin samples across clusters defined by key_fn, so no single cluster
+    dominates just because it's naturally more frequent in the source data - this
+    is the 'balanced' and 'skill' replay strategies; 'random' skips this entirely."""
+    buckets = defaultdict(list)
+    for i, row in enumerate(dataset):
+        buckets[key_fn(row)].append(i)
+    for idxs in buckets.values():
+        rng.shuffle(idxs)
+
+    keys = list(buckets.keys())
+    rng.shuffle(keys)
+    selected = []
+    cursors = {k: 0 for k in keys}
+    while len(selected) < n_target and keys:
+        progressed = False
+        for k in list(keys):
+            if cursors[k] < len(buckets[k]):
+                selected.append(buckets[k][cursors[k]])
+                cursors[k] += 1
+                progressed = True
+                if len(selected) >= n_target:
+                    break
+        if not progressed:
+            break
+    return dataset.select(selected[:n_target])
+
+
+def build_replay_mixed_dataset(original_path, extra_paths, replay_ratio, strategy="random", seed=0):
     """
+    strategy:
+      "none"     - ignore extra_paths entirely; pure original data (explicit no-replay baseline).
+      "random"   - uniform random sampling from original+augmented at replay_ratio (default,
+                   matches the original behavior of this function).
+      "balanced" - stratified sampling by (subject, level) cluster, so weak clusters being
+                   augmented don't dominate the mix just by being oversampled.
+      "skill"    - stratified sampling by primary skill label (first entry in the pipe-
+                   separated 'skills' field), for skill-balanced replay.
     replay_ratio: fraction of the FINAL training set that comes from the original
-    (unaugmented) data. e.g. 0.7 -> 70% original, 30% augmented, preventing the
-    weak-domain oversampling from crowding out previously-solid domains.
+    (unaugmented) data - applies to all strategies except "none".
     """
     rng = random.Random(seed)
     original = load_jsonl_as_dataset([original_path])
-    augmented = load_jsonl_as_dataset(extra_paths) if extra_paths else None
 
-    if augmented is None or len(augmented) == 0:
+    if strategy == "none" or not extra_paths:
+        if strategy != "none" and not extra_paths:
+            print("[replay-mix] no --extra_data given - using original data only")
         return original
 
-    n_total_target = len(original)  # keep dataset size stable across rounds
+    augmented = load_jsonl_as_dataset(extra_paths)
+    if len(augmented) == 0:
+        return original
+
+    n_total_target = len(original)
     n_original = int(n_total_target * replay_ratio)
     n_augmented = n_total_target - n_original
 
-    orig_idx = list(range(len(original)))
-    rng.shuffle(orig_idx)
-    aug_idx = list(range(len(augmented)))
-    rng.shuffle(aug_idx)
+    if strategy == "random":
+        orig_idx = list(range(len(original)))
+        rng.shuffle(orig_idx)
+        aug_idx = list(range(len(augmented)))
+        rng.shuffle(aug_idx)
+        orig_sample = original.select(orig_idx[:min(n_original, len(original))])
+        aug_sample = augmented.select([aug_idx[i % len(aug_idx)] for i in range(n_augmented)])
 
-    orig_sample = original.select(orig_idx[:min(n_original, len(original))])
-    aug_sample = augmented.select(
-        [aug_idx[i % len(aug_idx)] for i in range(min(n_augmented, n_augmented))]
-    )
+    elif strategy == "balanced":
+        cluster_key = lambda row: (row["subject"], row["level"])
+        orig_sample = _stratified_sample(original, min(n_original, len(original)), cluster_key, rng)
+        aug_sample = _stratified_sample(augmented, n_augmented, cluster_key, rng)
+
+    elif strategy == "skill":
+        def skill_key(row):
+            skills = (row.get("skills") or "").split("|")
+            return skills[0].strip() if skills and skills[0].strip() else "unknown"
+        orig_sample = _stratified_sample(original, min(n_original, len(original)), skill_key, rng)
+        aug_sample = _stratified_sample(augmented, n_augmented, skill_key, rng)
+
+    else:
+        raise ValueError(f"unknown replay strategy: {strategy}")
+
     mixed = concatenate_datasets([orig_sample, aug_sample]).shuffle(seed=seed)
-    print(f"[replay-mix] original={len(orig_sample)} augmented={len(aug_sample)} "
+    print(f"[replay-mix] strategy={strategy} original={len(orig_sample)} augmented={len(aug_sample)} "
           f"ratio_actual={len(orig_sample)/len(mixed):.2f}")
     return mixed
 
@@ -160,6 +246,11 @@ def main():
                      help="augmented jsonl files (semantic/numeric/multi-solution) for round 2")
     ap.add_argument("--replay_ratio", type=float, default=1.0,
                      help="fraction of final set from original data; 1.0 = no augmentation mixed in")
+    ap.add_argument("--replay_strategy", choices=["none", "random", "balanced", "skill"], default="random",
+                     help="none=ignore augmented data entirely (no-replay baseline); "
+                          "random=uniform mixing at --replay_ratio; balanced=stratify by "
+                          "(subject, level) cluster; skill=stratify by primary skill label. "
+                          "This is the replay-strategy comparison axis (random/balanced/skill/none).")
     ap.add_argument("--mode", choices=["full", "lora"], required=True)
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--lora_r", type=int, default=32)
@@ -230,14 +321,27 @@ def main():
               "partial/unstable. Falling back to plain bf16 LoRA (--use_bnb ignored).")
         args.use_bnb = False
 
-    if args.extra_data:
-        train_ds = build_replay_mixed_dataset(args.data, args.extra_data, args.replay_ratio)
-    else:
-        train_ds = load_jsonl_as_dataset([args.data])
+    # Save the full training spec immediately - before any expensive work starts -
+    # so experiment_ledger.py always has a record of exactly what was run, even if
+    # the session dies partway through training. Idempotent: safe to call again below.
+    ensure_dir(args.output_dir)
+    training_config = vars(args).copy()
+    with open(os.path.join(args.output_dir, "training_config.json"), "w") as f:
+        json.dump(training_config, f, indent=2, default=str)
+    print(f"[sft_train] saved training_config.json -> {args.output_dir}/training_config.json")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    if args.extra_data:
+        train_ds_raw = build_replay_mixed_dataset(args.data, args.extra_data, args.replay_ratio,
+                                                    strategy=args.replay_strategy, seed=args.seed)
+    else:
+        train_ds_raw = load_jsonl_as_dataset([args.data])
+    print(f"[sft_train] rendering {len(train_ds_raw)} examples with {args.model}'s own "
+          f"chat template (or plain-completion format if it has none) via templates.py")
+    train_ds = render_dataset_for_model(train_ds_raw, tokenizer)
 
     quantization_config = None
     if args.use_bnb:
